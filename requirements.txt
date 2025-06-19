@@ -1,6 +1,16 @@
-torch
-numpy
-tqdm
-tensorboard
-ml-collections
-timm
+# requirements.txt
+# pip typing-extensions==4.4.0
+# pip install torch==1.7.0+cu110 torchvision==0.8.1+cu110 torchaudio===0.7.0 -f https://download.pytorch.org/whl/torch_stable.html
+# pip install torch==1.7.0+cpu torchvision==0.8.1+cpu torchaudio===0.7.0 -f https://download.pytorch.org/whl/torch_stable.html
+# torch==1.7.0
+# numpy==1.18.5
+tqdm==4.46.0
+tensorboard==2.2.0
+ml-collections==0.1.0
+timm==0.3.2
+pandas==1.0.5
+scikit-image==0.17.2
+protobuf==3.20.3
+scikit-learn==0.23.2
+efficientnet_pytorch==0.6.3
+yacs==0.1.8
