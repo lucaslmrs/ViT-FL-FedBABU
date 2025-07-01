@@ -5,6 +5,7 @@ import os
 import sys
 import argparse
 import numpy as np
+import pandas as pd
 from math import ceil
 
 import torch
@@ -17,6 +18,159 @@ from utils.data_utils import DatasetFLViT, create_dataset_and_evalmetrix
 from utils.util import valid
 from utils.start_config import initization_configure
 
+def finetune_head_per_client(args, model, writer):
+    """Fine-tune apenas a cabeça do modelo para cada cliente individualmente"""
+    print("=============== Iniciando Fine-tuning da Cabeça por Cliente ===============")
+    
+    # Primeiro, descongelar apenas a cabeça
+    for param in model.parameters():
+        param.requires_grad = False
+    
+    # Descongelar apenas a cabeça/classifier
+    if hasattr(model, 'head'):
+        for param in model.head.parameters():
+            param.requires_grad = True
+        print("Head do modelo descongelada para fine-tuning")
+    elif hasattr(model, 'classifier'):
+        for param in model.classifier.parameters():
+            param.requires_grad = True
+        print("Classifier do modelo descongelado para fine-tuning")
+    
+    # Configurar otimizador apenas para parâmetros da cabeça
+    head_params = [p for p in model.parameters() if p.requires_grad]
+    head_optimizer = torch.optim.AdamW(head_params, lr=args.finetune_lr, weight_decay=0.01)
+    
+    # Configurar loss function
+    if args.num_classes == 1:
+        loss_fct = torch.nn.MSELoss()
+    else:
+        loss_fct = torch.nn.CrossEntropyLoss()
+    
+    # Fine-tuning para cada cliente
+    client_results = {}
+    
+    for client_idx, single_client in enumerate(args.dis_cvs_files):
+        print(f"\n--- Fine-tuning para Cliente {single_client} ---")
+        args.single_client = single_client
+        
+        # Preparar dados do cliente
+        trainset = DatasetFLViT(args, phase='train')
+        train_loader = DataLoader(trainset, sampler=RandomSampler(trainset), 
+                                batch_size=args.batch_size, num_workers=args.num_workers)
+        
+        if args.dataset == 'CelebA':
+            valset = DatasetFLViT(args, phase='val')
+            val_loader = DataLoader(valset, sampler=SequentialSampler(valset), 
+                                  batch_size=args.batch_size, num_workers=args.num_workers)
+        else:
+            valset = DatasetFLViT(args, phase='val')
+            val_loader = DataLoader(valset, sampler=SequentialSampler(valset), 
+                                  batch_size=args.batch_size, num_workers=8)
+        
+        testset = DatasetFLViT(args, phase='test')
+        test_loader = DataLoader(testset, sampler=SequentialSampler(testset), 
+                               batch_size=args.batch_size, num_workers=8)
+        
+        # Salvar estado inicial da cabeça (opcional - para comparação)
+        initial_head_state = {}
+        if hasattr(model, 'head'):
+            initial_head_state = model.head.state_dict().copy()
+        elif hasattr(model, 'classifier'):
+            initial_head_state = model.classifier.state_dict().copy()
+        
+        model.train()
+        best_acc = 0.0
+        best_head_state = None
+        
+        # Fine-tuning epochs
+        for ft_epoch in range(args.finetune_epochs):
+            epoch_loss = 0.0
+            num_batches = 0
+            
+            for step, batch in enumerate(train_loader):
+                batch = tuple(t.to(args.device) for t in batch)
+                x, y = batch
+                if args.num_classes == 1:
+                    y = y.float()
+                
+                head_optimizer.zero_grad()
+                predict = model(x)
+                loss = loss_fct(predict.view(-1, args.num_classes), y.view(-1))
+                
+                loss.backward()
+                head_optimizer.step()
+                
+                epoch_loss += loss.item()
+                num_batches += 1
+                
+                # Log a cada 10 steps
+                if (step + 1) % 10 == 0:
+                    print(f"Cliente {single_client} FT Epoch {ft_epoch}, Step {step+1}/{len(train_loader)}, Loss: {loss.item():.4f}")
+            
+            avg_loss = epoch_loss / num_batches
+            
+            # Validação após cada época de fine-tuning
+            model.eval()
+            with torch.no_grad():
+                val_acc = valid(args, model, val_loader, test_loader, TestFlag=False)
+                
+                if val_acc > best_acc:
+                    best_acc = val_acc
+                    if hasattr(model, 'head'):
+                        best_head_state = model.head.state_dict().copy()
+                    elif hasattr(model, 'classifier'):
+                        best_head_state = model.classifier.state_dict().copy()
+            
+            model.train()
+            
+            # Logging
+            writer.add_scalar(f"finetune/{single_client}/loss", avg_loss, ft_epoch)
+            writer.add_scalar(f"finetune/{single_client}/val_acc", val_acc, ft_epoch)
+            
+            print(f"Cliente {single_client} FT Epoch {ft_epoch}: Loss {avg_loss:.4f}, Val Acc: {val_acc:.4f}")
+        
+        # Carregar melhor estado da cabeça
+        if best_head_state is not None:
+            if hasattr(model, 'head'):
+                model.head.load_state_dict(best_head_state)
+            elif hasattr(model, 'classifier'):
+                model.classifier.load_state_dict(best_head_state)
+        
+        # Avaliação final do cliente
+        model.eval()
+        with torch.no_grad():
+            final_acc = valid(args, model, val_loader, test_loader, TestFlag=True)
+        
+        client_results[single_client] = {
+            'best_val_acc': best_acc,
+            'final_test_acc': final_acc
+        }
+        
+        # Salvar modelo específico do cliente (opcional)
+        if args.save_model_flag:
+            client_model_path = os.path.join(args.output_dir, f'client_{single_client}_finetuned_head.pth')
+            if hasattr(model, 'head'):
+                torch.save(model.head.state_dict(), client_model_path)
+            elif hasattr(model, 'classifier'):
+                torch.save(model.classifier.state_dict(), client_model_path)
+            print(f"Cabeça fine-tuned do cliente {single_client} salva em {client_model_path}")
+        
+        print(f"Cliente {single_client} - Melhor Val Acc: {best_acc:.4f}, Test Acc Final: {final_acc:.4f}")
+    
+    # Salvar resultados finais
+    results_df = pd.DataFrame.from_dict(client_results, orient='index')
+    results_df.to_csv(os.path.join(args.output_dir, 'finetune_head_results.csv'))
+    
+    print("\n=============== Fine-tuning da Cabeça Concluído ===============")
+    print("Resultados por cliente:")
+    for client, results in client_results.items():
+        print(f"Cliente {client}: Val Acc {results['best_val_acc']:.4f}, Test Acc {results['final_test_acc']:.4f}")
+    
+    return client_results
+
+
+
+
 def train(args, model):
     """ Train the model """
     os.makedirs(args.output_dir, exist_ok=True)
@@ -24,6 +178,22 @@ def train(args, model):
 
     # Prepare dataset
     create_dataset_and_evalmetrix(args)
+
+    # FASE 1: Congelar cabeça se especificado
+    if args.freeze_head:
+        if hasattr(model, 'head'):
+            for param in model.head.parameters():
+                param.requires_grad = False
+            print("Head do modelo Swin congelada para treinamento CWT_BABU")
+        elif hasattr(model, 'classifier'):
+            for param in model.classifier.parameters():
+                param.requires_grad = False
+            print("Classifier do modelo ViT congelado para treinamento CWT_BABU")
+        
+        # Verificar quais parâmetros estão treináveis
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in model.parameters())
+        print(f"Parâmetros treináveis: {trainable_params:,} / {total_params:,}")
 
     testset = DatasetFLViT(args, phase = 'test' )
     test_loader = DataLoader(testset, sampler=SequentialSampler(testset), batch_size=args.batch_size, num_workers=8)
@@ -123,6 +293,21 @@ def train(args, model):
     writer.close()
     print("================End training! ================ ")
 
+    # FASE 2: Fine-tuning da cabeça após treinamento principal
+    if args.finetune_head:
+        print("================Iniciando Fine-tuning da Cabeça ================ ")
+        # Reabrir writer para fine-tuning
+        writer = SummaryWriter(log_dir=os.path.join(args.output_dir, "finetune_logs"))
+        
+        # Realizar fine-tuning da cabeça por cliente
+        finetune_results = finetune_head_per_client(args, model, writer)
+        
+        writer.close()
+        
+        return finetune_results
+    
+    return None
+
 
 
 
@@ -137,6 +322,16 @@ def main():
 
     parser.add_argument("--save_model_flag",  action='store_true', default=False,  help="Save the best model for each client.")
     parser.add_argument("--cfg",  type=str, default="configs/swin_tiny_patch4_window7_224.yaml", metavar="FILE", help='path to args file for Swin-FL',)
+
+    # Parâmetros para FedBABU
+    parser.add_argument('--freeze_head', action='store_true', default=False, 
+                       help="Congelar apenas a cabeça do modelo para CWT_BABU")
+    parser.add_argument('--finetune_head', action='store_true', default=False,
+                       help="Realizar fine-tuning da cabeça após treinamento")
+    parser.add_argument('--finetune_epochs', type=int, default=5,
+                       help="Número de épocas para fine-tuning da cabeça")
+    parser.add_argument('--finetune_lr', type=float, default=1e-4,
+                       help="Learning rate para fine-tuning da cabeça")
 
     parser.add_argument('--Pretrained', action='store_true', default=True, help="Whether use pretrained or not")
     parser.add_argument("--pretrained_dir", type=str, default="checkpoint/swin_tiny_patch4_window7_224.pth", help="Where to search for pretrained ViT models. [ViT-B_16.npz,  imagenet21k+imagenet2012_R50+ViT-B_16.npz]")
@@ -172,13 +367,18 @@ def main():
     model = initization_configure(args)
 
     # Training, Validating, and Testing
-    train(args, model)
+    finetune_results = train(args, model)
 
     # Show final performance
-
     message = '\n \n ==============Start showing final performance ================= \n'
     message += 'Final union test accuracy is: %2.5f with std: %2.5f \n' %  \
                    (np.asarray(list(args.current_test_acc.values())).mean(),  np.asarray(list(args.current_test_acc.values())).std())
+    
+    # Adicionar resultados do fine-tuning se disponível
+    if finetune_results is not None:
+        finetune_test_accs = [results['final_test_acc'] for results in finetune_results.values()]
+        message += f'Fine-tuned test accuracy - Mean: {np.mean(finetune_test_accs):.5f}, Std: {np.std(finetune_test_accs):.5f} \n'
+    
     message += "================ End ================ \n"
 
     with open(args.file_name, 'a+') as args_file:
